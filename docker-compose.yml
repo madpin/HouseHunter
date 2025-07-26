@@ -1,0 +1,47 @@
+version: '3.8'
+
+services:
+  househunter-api:
+    build: .
+    container_name: househunter-api
+    ports:
+      - "8000:8086"
+    volumes:
+      - .:/app
+      - /app/venv  # Exclude virtual environment from volume mount
+    env_file:
+      - .env
+    environment:
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8086/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+    networks:
+      - househunter-network
+
+  # Optional: Add a database service for future use
+  # postgres:
+  #   image: postgres:15-alpine
+  #   container_name: househunter-db
+  #   environment:
+  #     POSTGRES_DB: househunter
+  #     POSTGRES_USER: househunter
+  #     POSTGRES_PASSWORD: househunter
+  #   ports:
+  #     - "5432:5432"
+  #   volumes:
+  #     - postgres_data:/var/lib/postgresql/data
+  #   networks:
+  #     - househunter-network
+
+networks:
+  househunter-network:
+    driver: bridge
+
+# volumes:
+#   postgres_data: 
