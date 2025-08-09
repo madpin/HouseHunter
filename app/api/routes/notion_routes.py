@@ -4,6 +4,7 @@ from pydantic import HttpUrl
 from app.models.property import Property
 from app.services.notion_service import NotionService
 from app.services.property_service import PropertyService
+from app.services.interest_points_service import InterestPointsService
 from app.scrapers.scraper_factory import ScraperFactory
 
 router = APIRouter(prefix="/notion", tags=["notion"])
@@ -17,12 +18,16 @@ def get_property_service() -> PropertyService:
 
 def get_scraper_factory() -> ScraperFactory:
     return ScraperFactory()
+ 
+def get_interest_points_service() -> InterestPointsService:
+    return InterestPointsService()
 
 @router.post("/properties/save")
 async def save_property_to_notion(
     property_id: str,
     notion_service: NotionService = Depends(get_notion_service),
-    property_service: PropertyService = Depends(get_property_service)
+    property_service: PropertyService = Depends(get_property_service),
+    interest_points_service: InterestPointsService = Depends(get_interest_points_service)
 ):
     """
     Save an existing property to Notion database
@@ -33,8 +38,27 @@ async def save_property_to_notion(
         if not property_obj:
             raise HTTPException(status_code=404, detail="Property not found")
         
-        # Save to Notion
-        result = await notion_service.save_property_to_notion(property_obj)
+        # Compute predictions if property has coordinates, to enrich the Notion note
+        prediction_info = None
+        try:
+            if (
+                hasattr(property_obj, 'address') and 
+                hasattr(property_obj.address, 'latitude') and 
+                hasattr(property_obj.address, 'longitude') and
+                property_obj.address.latitude is not None and 
+                property_obj.address.longitude is not None
+            ):
+                property_address = f"{property_obj.address.city}, {property_obj.address.county or ''}"
+                prediction_info = await interest_points_service.calculate_predictions_for_property(
+                    property_obj.address.latitude,
+                    property_obj.address.longitude,
+                    property_address
+                )
+        except Exception:
+            prediction_info = None
+        
+        # Save to Notion (pass predictions)
+        result = await notion_service.save_property_to_notion(property_obj, prediction_info)
         
         if result["success"]:
             return result
@@ -51,7 +75,8 @@ async def ingest_and_save_to_notion(
     url: HttpUrl,
     notion_service: NotionService = Depends(get_notion_service),
     property_service: PropertyService = Depends(get_property_service),
-    scraper_factory: ScraperFactory = Depends(get_scraper_factory)
+    scraper_factory: ScraperFactory = Depends(get_scraper_factory),
+    interest_points_service: InterestPointsService = Depends(get_interest_points_service)
 ):
     """
     Ingest a property from URL and save it to Notion database
@@ -77,8 +102,27 @@ async def ingest_and_save_to_notion(
         # Save to our database first
         saved_property = await property_service.create_property(property_data)
         
-        # Save to Notion
-        notion_result = await notion_service.save_property_to_notion(saved_property)
+        # Compute predictions (if coordinates exist) before saving to Notion
+        prediction_info = None
+        try:
+            if (
+                hasattr(saved_property, 'address') and 
+                hasattr(saved_property.address, 'latitude') and 
+                hasattr(saved_property.address, 'longitude') and
+                saved_property.address.latitude is not None and 
+                saved_property.address.longitude is not None
+            ):
+                property_address = f"{saved_property.address.city}, {saved_property.address.county or ''}"
+                prediction_info = await interest_points_service.calculate_predictions_for_property(
+                    saved_property.address.latitude,
+                    saved_property.address.longitude,
+                    property_address
+                )
+        except Exception:
+            prediction_info = None
+        
+        # Save to Notion with predictions
+        notion_result = await notion_service.save_property_to_notion(saved_property, prediction_info)
         
         return {
             "property": saved_property,

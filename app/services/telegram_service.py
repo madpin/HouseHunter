@@ -1,6 +1,6 @@
 import logging
 import re
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 from telegram import Update, Bot
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from pydantic import HttpUrl, ValidationError
@@ -64,6 +64,93 @@ class TelegramService:
         url_pattern = r'https?://[^\s<>"{}|\\^`\[\]]+'
         return re.findall(url_pattern, text)
     
+    def _split_message(self, message: str, max_length: int = 4000) -> List[str]:
+        """
+        Split a long message into multiple parts that fit within Telegram's limits
+        
+        Args:
+            message: The message to split
+            max_length: Maximum length per message (default 4000 to be safe)
+            
+        Returns:
+            List of message parts
+        """
+        if len(message) <= max_length:
+            return [message]
+        
+        parts = []
+        current_part = ""
+        lines = message.split('\n')
+        
+        for line in lines:
+            # If adding this line would exceed the limit
+            if len(current_part) + len(line) + 1 > max_length:
+                # Save current part if it's not empty
+                if current_part.strip():
+                    parts.append(current_part.strip())
+                
+                # Start new part with this line
+                current_part = line
+            else:
+                # Add line to current part
+                if current_part:
+                    current_part += '\n' + line
+                else:
+                    current_part = line
+        
+        # Add the last part if it's not empty
+        if current_part.strip():
+            parts.append(current_part.strip())
+        
+        return parts
+    
+    async def _send_long_message(self, chat_id: int, message: str, parse_mode: str = None) -> List[Any]:
+        """
+        Send a potentially long message by splitting it if necessary
+        
+        Args:
+            chat_id: The chat ID to send the message to
+            message: The message to send
+            parse_mode: Parse mode for the message
+            
+        Returns:
+            List of sent message objects
+        """
+        if not self.application or not self.application.bot:
+            logger.error("Bot not initialized, cannot send message")
+            return []
+        
+        parts = self._split_message(message)
+        sent_messages = []
+        
+        for i, part in enumerate(parts):
+            try:
+                if i == 0:
+                    # First part - edit the existing processing message
+                    # We'll need to handle this differently since we're editing
+                    pass
+                else:
+                    # Additional parts - send as new messages
+                    sent_msg = await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=part,
+                        parse_mode=parse_mode
+                    )
+                    sent_messages.append(sent_msg)
+            except Exception as e:
+                logger.error(f"Failed to send message part {i+1}: {e}")
+                # Try to send without parse_mode if it fails
+                try:
+                    sent_msg = await self.application.bot.send_message(
+                        chat_id=chat_id,
+                        text=part
+                    )
+                    sent_messages.append(sent_msg)
+                except Exception as e2:
+                    logger.error(f"Failed to send message part {i+1} without parse_mode: {e2}")
+        
+        return sent_messages
+
     async def start_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle /start command"""
         welcome_message = (
@@ -140,6 +227,205 @@ class TelegramService:
         )
         
         await update.message.reply_text(message)
+    
+    async def predictions_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        """Handle /predictions command - show detailed prediction times for a property"""
+        # Check if this is a reply to a property message
+        if not update.message.reply_to_message:
+            await update.message.reply_text(
+                "📋 **Usage**: Reply to a property message with `/predictions` to see detailed travel times.\n\n"
+                "This command shows comprehensive route information including:\n"
+                "• Detailed route breakdowns\n"
+                "• Walking segments\n"
+                "• Transit line information\n"
+                "• Alternative routes"
+            )
+            return
+        
+        # Check if the replied message contains property information
+        replied_text = update.message.reply_to_message.text
+        if "Property saved successfully" not in replied_text:
+            await update.message.reply_text(
+                "❌ Please reply to a property message (one that shows 'Property saved successfully') to see detailed predictions."
+            )
+            return
+        
+        # Extract the property URL from the replied message
+        url_match = re.search(r'https?://[^\s<>"{}|\\^`\[\]]+', replied_text)
+        if not url_match:
+            await update.message.reply_text(
+                "❌ Could not find the property URL in the replied message."
+            )
+            return
+        
+        property_url = url_match.group(0)
+        
+        # Send processing message
+        processing_msg = await update.message.reply_text(
+            "🔄 Calculating detailed prediction times..."
+        )
+        
+        try:
+            # Get the property from the database
+            property_data = await self.property_service.get_property_by_url(property_url)
+            if not property_data:
+                await processing_msg.edit_text(
+                    "❌ Property not found in database. Please try processing the property URL again."
+                )
+                return
+            
+            # Check if property has coordinates
+            if not (hasattr(property_data, 'address') and 
+                   hasattr(property_data.address, 'latitude') and 
+                   hasattr(property_data.address, 'longitude') and
+                   property_data.address.latitude is not None and 
+                   property_data.address.longitude is not None):
+                await processing_msg.edit_text(
+                    "❌ Property coordinates not available. Cannot calculate travel times."
+                )
+                return
+            
+            # Calculate predictions
+            property_address = f"{property_data.address.city}, {property_data.address.county or ''}"
+            prediction_info = await self.interest_points_service.calculate_predictions_for_property(
+                property_data.address.latitude,
+                property_data.address.longitude,
+                property_address
+            )
+            
+            if not prediction_info or not prediction_info.predictions:
+                await processing_msg.edit_text(
+                    "❌ No prediction data available for this property."
+                )
+                return
+            
+            # Build detailed message
+            detailed_message = (
+                f"🚗 **Detailed Travel Times for Next Friday 9am**\n"
+                f"📍 **Property**: {property_data.address.city}, {property_data.address.county or ''}\n\n"
+            )
+            
+            for i, prediction in enumerate(prediction_info.predictions, 1):
+                point_name = prediction.destination_point_id
+                interest_point = self.interest_points_service.get_interest_point_by_id(prediction.destination_point_id)
+                if interest_point:
+                    point_name = interest_point.name
+                
+                # Transportation mode emojis
+                transport_emojis = {
+                    "DRIVING": "🚗",
+                    "WALKING": "🚶",
+                    "PUBLIC_TRANSPORT": "🚌",
+                    "BICYCLING": "🚲",
+                    "TRUCK": "🚛",
+                    "TAXI": "🚕",
+                    "BUS": "🚌",
+                    "TRAIN": "🚆",
+                    "SUBWAY": "🚇",
+                    "TRAM": "🚊",
+                    "FERRY": "⛴️"
+                }
+                
+                transport_emoji = transport_emojis.get(prediction.transportation_mode.value.upper(), "🚗")
+                distance_display = f"{prediction.distance_km:.1f}km" if prediction.distance_km >= 1.0 else f"{prediction.distance_km:.3f}km"
+                
+                detailed_message += (
+                    f"**{i}. {transport_emoji} {point_name}**\n"
+                    f"⏱️ {prediction.duration_minutes}min • 📏 {distance_display}\n"
+                    f"🕐 Depart: {prediction.departure_time} • Arrive: {prediction.arrival_time}\n\n"
+                )
+                
+                # Add detailed route breakdown
+                if prediction.route_details and len(prediction.route_details) > 0:
+                    detailed_message += "**Route Details:**\n"
+                    
+                    for j, section in enumerate(prediction.route_details, 1):
+                        section_type = section.get("type", "unknown")
+                        duration = section.get("duration_minutes", 0)
+                        distance_m = section.get("distance_m", 0)
+                        
+                        if section_type == "transit":
+                            mode = section.get("mode", "unknown")
+                            name = section.get("name", "Unknown")
+                            line = section.get("line", "")
+                            
+                            mode_emojis = {
+                                "bus": "🚌",
+                                "train": "🚆", 
+                                "subway": "🚇",
+                                "tram": "🚊",
+                                "ferry": "⛴️",
+                                "lightRail": "🚊",
+                                "cityTrain": "🚆",
+                                "regionalTrain": "🚆",
+                                "intercityTrain": "🚆"
+                            }
+                            
+                            mode_emoji = mode_emojis.get(mode, "🚌")
+                            distance_km = distance_m / 1000
+                            distance_display = f"{distance_km:.1f}km" if distance_km >= 1.0 else f"{distance_km:.3f}km"
+                            
+                            if line and line != "Unknown":
+                                detailed_message += f"  {j}. {mode_emoji} **{line}** ({duration}min, {distance_display})\n"
+                            else:
+                                detailed_message += f"  {j}. {mode_emoji} **{name}** ({duration}min, {distance_display})\n"
+                                
+                        elif section_type == "pedestrian":
+                            distance_km = distance_m / 1000
+                            distance_display = f"{distance_km:.1f}km" if distance_km >= 1.0 else f"{distance_km:.3f}km"
+                            detailed_message += f"  {j}. 🚶 **Walking** ({duration}min, {distance_display})\n"
+                            
+                        else:
+                            detailed_message += f"  {j}. **{section_type.title()}** ({duration}min)\n"
+                    
+                    # Add summary
+                    num_legs = len(prediction.route_details)
+                    total_walking = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "pedestrian")
+                    total_transit = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "transit")
+                    
+                    walking_legs = sum(1 for s in prediction.route_details if s.get("type") == "pedestrian")
+                    transit_legs = sum(1 for s in prediction.route_details if s.get("type") == "transit")
+                    
+                    summary_parts = []
+                    if transit_legs > 0:
+                        summary_parts.append(f"🚌 {transit_legs} transit")
+                    if walking_legs > 0:
+                        summary_parts.append(f"🚶 {walking_legs} walking")
+                    
+                    detailed_message += f"📊 **Summary**: {num_legs} legs • {' + '.join(summary_parts)}\n"
+                    detailed_message += f"⏱️ **Total**: {total_transit}min transit + {total_walking}min walking\n\n"
+                
+                detailed_message += "─" * 40 + "\n\n"
+            
+            # Check if message is too long and split if necessary
+            if len(detailed_message) > 4000:
+                parts = self._split_message(detailed_message)
+                
+                # Edit the first part into the processing message
+                try:
+                    await processing_msg.edit_text(parts[0], parse_mode='Markdown')
+                except Exception as e:
+                    logger.warning(f"Failed to edit first detailed message part: {e}")
+                    await update.message.reply_text(parts[0], parse_mode='Markdown')
+                
+                # Send remaining parts as new messages
+                for part in parts[1:]:
+                    try:
+                        await update.message.reply_text(part, parse_mode='Markdown')
+                    except Exception as e:
+                        logger.warning(f"Failed to send detailed message part: {e}")
+                        try:
+                            await update.message.reply_text(part)
+                        except Exception as e2:
+                            logger.error(f"Failed to send detailed message part without parse_mode: {e2}")
+            else:
+                await processing_msg.edit_text(detailed_message, parse_mode='Markdown')
+                
+        except Exception as e:
+            await processing_msg.edit_text(
+                f"❌ Error calculating detailed predictions: {str(e)}"
+            )
+            logger.error(f"Error in predictions command: {e}")
     
     async def handle_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming messages"""
@@ -248,14 +534,7 @@ class TelegramService:
             
             saved_property = await self.property_service.create_property(property_data)
             
-            # Save to Notion
-            await processing_msg.edit_text(
-                f"📝 Saving to Notion database...\n📍 {url_str}"
-            )
-            
-            notion_result = await self.notion_service.save_property_to_notion(saved_property)
-            
-            # Calculate prediction times for next Friday at 9am
+            # Calculate prediction times for next Friday at 9am BEFORE saving to Notion
             await processing_msg.edit_text(
                 f"🚗 Calculating prediction times for next Friday 9am...\n📍 {url_str}"
             )
@@ -313,12 +592,19 @@ class TelegramService:
                 import traceback
                 logger.warning(f"Traceback: {traceback.format_exc()}")
             
+            # Save to Notion (pass predictions so the Transportation section is included)
+            await processing_msg.edit_text(
+                f"📝 Saving to Notion database...\n📍 {url_str}"
+            )
+            
+            notion_result = await self.notion_service.save_property_to_notion(saved_property, prediction_info)
+            
             # Send success/failure message
             if notion_result.get("success"):
                 # Add username prefix for group chats
                 username_prefix = f"👤 @{username}: " if update.effective_chat.type in ['group', 'supergroup'] else ""
                 
-                # Build success message
+                # Build concise success message
                 success_message = (
                     f"{username_prefix}✅ Property saved successfully!\n\n"
                     f"🏠 {property_data.property_type.value.title()}\n"
@@ -331,7 +617,9 @@ class TelegramService:
                 # Add prediction times if available
                 if prediction_info and prediction_info.predictions and len(prediction_info.predictions) > 0:
                     success_message += f"🚗 **Next Friday 9am Predictions:**\n"
-                    for prediction in prediction_info.predictions:
+                    
+                    # Show all predictions to display all interest points
+                    for i, prediction in enumerate(prediction_info.predictions):
                         point_name = prediction.destination_point_id
                         # Try to get the actual point name
                         interest_point = self.interest_points_service.get_interest_point_by_id(prediction.destination_point_id)
@@ -375,76 +663,6 @@ class TelegramService:
                                 }
                                 transport_emoji = mode_emojis.get(primary_mode, "🚌")
                         
-                        # Build route details
-                        route_info = ""
-                        if prediction.route_details:
-                            route_details = prediction.route_details
-                            
-                            # Format route details for public transport
-                            if prediction.transportation_mode.value == "publicTransport":
-                                route_parts = []
-                                
-                                for section in route_details:
-                                    section_type = section.get("type", "unknown")
-                                    if section_type == "transit":
-                                        mode = section.get("mode", "unknown")
-                                        name = section.get("name", "Unknown")
-                                        line = section.get("line", "")
-                                        
-                                        # Mode-specific emojis
-                                        mode_emojis = {
-                                            "bus": "🚌",
-                                            "train": "🚆", 
-                                            "subway": "🚇",
-                                            "tram": "🚊",
-                                            "ferry": "⛴️",
-                                            "lightRail": "🚊",
-                                            "cityTrain": "🚆",
-                                            "regionalTrain": "🚆",
-                                            "intercityTrain": "🚆"
-                                        }
-                                        
-                                        mode_emoji = mode_emojis.get(mode, "🚌")
-                                        if line and line != "Unknown":
-                                            route_parts.append(f"{mode_emoji} {line}")
-                                        else:
-                                            route_parts.append(f"{mode_emoji} {name}")
-                                            
-                                    elif section_type == "pedestrian":
-                                        duration = section.get("duration_minutes", 0)
-                                        if duration > 0:
-                                            if duration < 1:
-                                                route_parts.append("🚶 short walk")
-                                            elif duration < 5:
-                                                route_parts.append(f"🚶 {duration}min walk")
-                                            else:
-                                                route_parts.append(f"🚶 {duration}min walking")
-                                
-                                if route_parts:
-                                    route_info = " • " + " + ".join(route_parts)
-                            else:
-                                # Handle other transportation modes (driving, walking, etc.)
-                                if route_details.get("transport_legs"):
-                                    transport_legs = route_details["transport_legs"]
-                                    if len(transport_legs) == 1:
-                                        route_info = f" • {transport_legs[0]['line']}"
-                                    else:
-                                        transport_names = [leg.get('line', 'Unknown') for leg in transport_legs]
-                                        route_info = f" • {' + '.join(transport_names)}"
-                                
-                                # Add walking information
-                                total_walking = route_details.get("total_walking_minutes", 0)
-                                if total_walking > 0:
-                                    if total_walking < 1:
-                                        route_info += " • short walk"
-                                    elif total_walking < 5:
-                                        route_info += f" • {total_walking}min walk"
-                                    else:
-                                        route_info += f" • {total_walking}min walking"
-                        
-                        # Use route summary if available, otherwise use route_info
-                        route_display = prediction.route_summary if prediction.route_summary else route_info
-                        
                         # Format distance with one decimal place (unless less than 1km)
                         distance_display = f"{prediction.distance_km:.1f}km" if prediction.distance_km >= 1.0 else f"{prediction.distance_km:.3f}km"
                         
@@ -470,27 +688,10 @@ class TelegramService:
                             f"{prediction.duration_minutes}min ({distance_display}){walking_info}\n"
                             f"  Depart: {prediction.departure_time} • Arrive: {prediction.arrival_time}\n"
                         )
-                        
-                        # Add route summary information if available
-                        if prediction.route_details and len(prediction.route_details) > 0:
-                            num_legs = len(prediction.route_details)
-                            total_walking = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "pedestrian")
-                            total_transit = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "transit")
-                            
-                            # Count different types of legs
-                            walking_legs = sum(1 for s in prediction.route_details if s.get("type") == "pedestrian")
-                            transit_legs = sum(1 for s in prediction.route_details if s.get("type") == "transit")
-                            
-                            summary_parts = []
-                            if transit_legs > 0:
-                                summary_parts.append(f"🚌 {transit_legs} transit")
-                            if walking_legs > 0:
-                                summary_parts.append(f"🚶 {walking_legs} walking")
-                            
-                            summary_text = f"  📊 {num_legs} legs: {' + '.join(summary_parts)} • ⏱️ {total_transit}min transit + {total_walking}min walking"
-                            success_message += f"{summary_text}\n"
-                        
-                        success_message += "\n"
+                    
+
+                    
+                    success_message += "\n"
                 
                 elif not has_coordinates:
                     success_message += "⚠️ *Prediction times not available* - Property coordinates not found\n\n"
@@ -503,7 +704,33 @@ class TelegramService:
                     f"🔗 [Original listing]({url_str})"
                 )
                 
-                await processing_msg.edit_text(success_message, parse_mode='Markdown')
+                # Check if message is too long and split if necessary
+                if len(success_message) > 4000:
+                    # Split the message and send as multiple messages
+                    parts = self._split_message(success_message)
+                    
+                    # Edit the first part into the existing processing message
+                    try:
+                        await processing_msg.edit_text(parts[0], parse_mode='Markdown')
+                    except Exception as e:
+                        logger.warning(f"Failed to edit first message part: {e}")
+                        # If editing fails, send as new message
+                        await update.message.reply_text(parts[0], parse_mode='Markdown')
+                    
+                    # Send remaining parts as new messages
+                    for part in parts[1:]:
+                        try:
+                            await update.message.reply_text(part, parse_mode='Markdown')
+                        except Exception as e:
+                            logger.warning(f"Failed to send message part: {e}")
+                            # Try without parse_mode if it fails
+                            try:
+                                await update.message.reply_text(part)
+                            except Exception as e2:
+                                logger.error(f"Failed to send message part without parse_mode: {e2}")
+                else:
+                    # Message is short enough, just edit the existing message
+                    await processing_msg.edit_text(success_message, parse_mode='Markdown')
                 
                 logger.info(f"Successfully processed property for user {username}: {url_str}")
             else:
@@ -517,7 +744,29 @@ class TelegramService:
                     f"❌ Notion error: {notion_result.get('error', 'Unknown error')}\n"
                     f"🔗 [Original listing]({url_str})"
                 )
-                await processing_msg.edit_text(error_message, parse_mode='Markdown')
+                # Check if error message is too long and split if necessary
+                if len(error_message) > 4000:
+                    parts = self._split_message(error_message)
+                    
+                    # Edit the first part into the existing processing message
+                    try:
+                        await processing_msg.edit_text(parts[0], parse_mode='Markdown')
+                    except Exception as e:
+                        logger.warning(f"Failed to edit first error message part: {e}")
+                        await update.message.reply_text(parts[0], parse_mode='Markdown')
+                    
+                    # Send remaining parts as new messages
+                    for part in parts[1:]:
+                        try:
+                            await update.message.reply_text(part, parse_mode='Markdown')
+                        except Exception as e:
+                            logger.warning(f"Failed to send error message part: {e}")
+                            try:
+                                await update.message.reply_text(part)
+                            except Exception as e2:
+                                logger.error(f"Failed to send error message part without parse_mode: {e2}")
+                else:
+                    await processing_msg.edit_text(error_message, parse_mode='Markdown')
                 
                 logger.error(f"Failed to save to Notion for user {username}: {notion_result.get('error')}")
                 
@@ -553,6 +802,7 @@ class TelegramService:
         self.application.add_handler(CommandHandler("help", self.help_command))
         self.application.add_handler(CommandHandler("status", self.status_command))
         self.application.add_handler(CommandHandler("supported", self.supported_command))
+        self.application.add_handler(CommandHandler("predictions", self.predictions_command))
         
         # Message handler for URLs
         self.application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.handle_message))

@@ -4,6 +4,7 @@ from app.models.property import Property, WebsiteListing, PropertyType, ListingS
 from datetime import datetime
 from app.config import config
 from app.services.interest_points_service import InterestPointsService
+from app.models.interest_points import PropertyPredictionInfo
 
 class NotionService:
     """Service for interacting with Notion API to save property data"""
@@ -27,6 +28,16 @@ class NotionService:
         
         self.client = Client(auth=self.notion_token)
         self.interest_points_service = InterestPointsService()
+        
+        # Cache database properties to validate optional fields like "Route Details"
+        self.database_properties = set()
+        try:
+            database = self.client.databases.retrieve(self.database_id)
+            self.database_properties = set(database.get("properties", {}).keys())
+        except Exception:
+            # If we cannot retrieve database schema now, continue without cached properties
+            # and avoid adding optional properties that might not exist
+            self.database_properties = set()
     
     def _format_price(self, price: float, currency: str = "EUR") -> str:
         """Format price for Notion display"""
@@ -74,7 +85,7 @@ class NotionService:
         
         return " | ".join(info_parts)
     
-    def _create_property_page_data(self, property_obj: Property) -> Dict[str, Any]:
+    def _create_property_page_data(self, property_obj: Property, prediction_info: Optional[PropertyPredictionInfo] = None) -> Dict[str, Any]:
         """Create Notion page data for a property"""
         
         # Get primary listing for main details
@@ -169,6 +180,76 @@ class NotionService:
             }
         }
         
+        # Add route details summary if we have predictions (either provided or computed safely)
+        if (
+            prediction_info is not None or (
+                hasattr(property_obj, 'address') and 
+                hasattr(property_obj.address, 'latitude') and 
+                hasattr(property_obj.address, 'longitude') and
+                property_obj.address.latitude is not None and 
+                property_obj.address.longitude is not None
+            )
+        ):
+            try:
+                prediction_info_local = prediction_info
+                # Only attempt to compute if not provided
+                if prediction_info_local is None:
+                    import asyncio
+                    try:
+                        # If a loop is already running, skip computing here to avoid runtime errors
+                        asyncio.get_running_loop()
+                        prediction_info_local = None
+                    except RuntimeError:
+                        # No running loop; safe to compute synchronously
+                        property_address = f"{property_obj.address.city}, {property_obj.address.county or ''}"
+                        prediction_info_local = asyncio.run(
+                            self.interest_points_service.calculate_predictions_for_property(
+                                property_obj.address.latitude,
+                                property_obj.address.longitude,
+                                property_address
+                            )
+                        )
+                if prediction_info_local and prediction_info_local.predictions:
+                    route_summaries = []
+                    for prediction in prediction_info_local.predictions:
+                        point_name = prediction.destination_point_id
+                        interest_point = self.interest_points_service.get_interest_point_by_id(prediction.destination_point_id)
+                        if interest_point:
+                            point_name = interest_point.name
+                        route_summary = f"{point_name}: {prediction.duration_minutes}min"
+                        if prediction.route_details:
+                            route_parts = []
+                            for section in prediction.route_details:
+                                section_type = section.get("type", "unknown")
+                                if section_type == "transit":
+                                    line = section.get("line", "")
+                                    if line and line != "Unknown":
+                                        route_parts.append(line)
+                                    else:
+                                        name = section.get("name", "Unknown")
+                                        route_parts.append(name)
+                                elif section_type == "pedestrian":
+                                    duration = section.get("duration_minutes", 0)
+                                    if duration > 0:
+                                        if duration < 1:
+                                            route_parts.append("walk")
+                                        elif duration < 5:
+                                            route_parts.append(f"{duration}m walk")
+                                        else:
+                                            route_parts.append(f"{duration}m walk")
+                            if route_parts:
+                                route_summary += f" ({' + '.join(route_parts)})"
+                        route_summaries.append(route_summary)
+                    if route_summaries and "Route Details" in self.database_properties:
+                        properties["Route Details"] = {
+                            "rich_text": [
+                                {"text": {"content": " | ".join(route_summaries)}}
+                            ]
+                        }
+            except Exception:
+                # Continue without route details if any error occurs
+                pass
+        
         # Add optional fields if they exist
         if property_obj.lot_size_sqm:
             properties["Lot Size (sqm)"] = {"number": property_obj.lot_size_sqm}
@@ -209,34 +290,35 @@ class NotionService:
                 }
             })
         
-        # Add prediction times section if coordinates are available
-        if (hasattr(property_obj, 'address') and 
-            hasattr(property_obj.address, 'latitude') and 
-            hasattr(property_obj.address, 'longitude') and
-            property_obj.address.latitude is not None and 
-            property_obj.address.longitude is not None):
+        # Add Transportation section if coordinates are available
+        if (
+            prediction_info is not None or (
+                hasattr(property_obj, 'address') and 
+                hasattr(property_obj.address, 'latitude') and 
+                hasattr(property_obj.address, 'longitude') and
+                property_obj.address.latitude is not None and 
+                property_obj.address.longitude is not None
+            )
+        ):
             try:
-                import asyncio
-                
-                # Create a new event loop for async operations
-                try:
-                    loop = asyncio.get_event_loop()
-                except RuntimeError:
-                    loop = asyncio.new_event_loop()
-                    asyncio.set_event_loop(loop)
-                
-                # Calculate prediction times
-                property_address = f"{property_obj.address.city}, {property_obj.address.county or ''}"
-                prediction_info = loop.run_until_complete(
-                    self.interest_points_service.calculate_predictions_for_property(
-                        property_obj.address.latitude,
-                        property_obj.address.longitude,
-                        property_address
-                    )
-                )
-                
-                if prediction_info and prediction_info.predictions:
-                    # Add prediction times section
+                prediction_info_local = prediction_info
+                # Only compute if not provided and safe to run
+                if prediction_info_local is None:
+                    import asyncio
+                    try:
+                        asyncio.get_running_loop()
+                        prediction_info_local = None
+                    except RuntimeError:
+                        property_address = f"{property_obj.address.city}, {property_obj.address.county or ''}"
+                        prediction_info_local = asyncio.run(
+                            self.interest_points_service.calculate_predictions_for_property(
+                                property_obj.address.latitude,
+                                property_obj.address.longitude,
+                                property_address
+                            )
+                        )
+                if prediction_info_local and prediction_info_local.predictions:
+                    # Add Transportation section heading
                     children.append({
                         "object": "block",
                         "type": "heading_2",
@@ -244,13 +326,27 @@ class NotionService:
                             "rich_text": [
                                 {
                                     "type": "text",
-                                    "text": {"content": f"🚗 Next Friday 9am Predictions"}
+                                    "text": {"content": f"🚦 Transportation"}
                                 }
                             ]
                         }
                     })
                     
-                    for prediction in prediction_info.predictions:
+                    # Add description
+                    children.append({
+                        "object": "block",
+                        "type": "paragraph",
+                        "paragraph": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {"content": "Routes to key locations from this property (departing next Friday at 09:00):"}
+                                }
+                            ]
+                        }
+                    })
+                    
+                    for prediction in prediction_info_local.predictions:
                         # Get interest point name
                         point_name = prediction.destination_point_id
                         interest_point = self.interest_points_service.get_interest_point_by_id(prediction.destination_point_id)
@@ -274,20 +370,20 @@ class NotionService:
                         }
                         mode_emoji = transport_emojis.get(prediction.transportation_mode.value, "🚗")
                         
-                        # Build route details
+                        # Build simple route info summary (from list of sections)
                         route_info = ""
-                        if prediction.route_details:
-                            route_details = prediction.route_details
-                            if route_details.get("transport_legs"):
-                                transport_legs = route_details["transport_legs"]
-                                if len(transport_legs) == 1:
-                                    route_info = f" • {transport_legs[0]['line']}"
-                                else:
-                                    transport_names = [leg.get('line', 'Unknown') for leg in transport_legs]
-                                    route_info = f" • {' + '.join(transport_names)}"
-                            
-                            # Add walking information
-                            total_walking = route_details.get("total_walking_minutes", 0)
+                        if prediction.route_details and isinstance(prediction.route_details, list):
+                            transit_lines = []
+                            total_walking = 0
+                            for section in prediction.route_details:
+                                if section.get("type") == "transit":
+                                    line = section.get("line") or section.get("name")
+                                    if line and line != "Unknown":
+                                        transit_lines.append(line)
+                                elif section.get("type") == "pedestrian":
+                                    total_walking += section.get("duration_minutes", 0)
+                            if transit_lines:
+                                route_info += f" • {' + '.join(transit_lines)}"
                             if total_walking > 0:
                                 if total_walking < 1:
                                     route_info += " • short walk"
@@ -296,7 +392,7 @@ class NotionService:
                                 else:
                                     route_info += f" • {total_walking}min walking"
                         
-                        # Use route summary if available, otherwise use route_info
+                        # Use route summary if available, otherwise use route_info (kept for future use)
                         route_display = prediction.route_summary if prediction.route_summary else route_info
                         
                         # Format distance with one decimal place (unless less than 1km)
@@ -319,10 +415,10 @@ class NotionService:
                             if total_walking > 0:
                                 walking_info = f" (🚶 {total_walking}min walking)"
                         
+                        # Summary bullet per destination
                         prediction_text = (
                             f"• {mode_emoji} {point_name}: "
                             f"{prediction.duration_minutes}min ({distance_display}){walking_info}"
-                            f"{route_display} • Depart: {prediction.departure_time} • Arrive: {prediction.arrival_time}"
                         )
                         
                         children.append({
@@ -338,23 +434,37 @@ class NotionService:
                             }
                         })
                         
-                        # Add detailed route information if available
+                        # Add route line and detailed route information if available
                         if prediction.route_details and len(prediction.route_details) > 0:
-                            # Add route details heading
+                            # Add route summary line
+                            route_summary_text = f"Route to {point_name} • Depart: {prediction.departure_time} • Arrive: {prediction.arrival_time}"
                             children.append({
                                 "object": "block",
-                                "type": "heading_3",
-                                "heading_3": {
+                                "type": "paragraph",
+                                "paragraph": {
                                     "rich_text": [
                                         {
                                             "type": "text",
-                                            "text": {"content": f"Route Details to {point_name}"}
+                                            "text": {"content": route_summary_text}
                                         }
                                     ]
                                 }
                             })
                             
-                            # Add route breakdown
+                            # Add route details label line
+                            children.append({
+                                "object": "block",
+                                "type": "paragraph",
+                                "paragraph": {
+                                    "rich_text": [
+                                        {
+                                            "type": "text",
+                                            "text": {"content": f"Route Details to {point_name}:"}
+                                        }
+                                    ]
+                                }
+                            })
+                            # Add route breakdown with better formatting
                             for i, section in enumerate(prediction.route_details, 1):
                                 section_type = section.get("type", "unknown")
                                 duration = section.get("duration_minutes", 0)
@@ -383,17 +493,17 @@ class NotionService:
                                     distance_display = f"{distance_km:.1f}km" if distance_km >= 1.0 else f"{distance_km:.3f}km"
                                     
                                     if line and line != "Unknown":
-                                        section_text = f"{i}. {mode_emoji} {line} ({duration}min, {distance_display})"
+                                        section_text = f"  {i}. {mode_emoji} {line} ({duration}min, {distance_display})"
                                     else:
-                                        section_text = f"{i}. {mode_emoji} {name} ({duration}min, {distance_display})"
+                                        section_text = f"  {i}. {mode_emoji} {name} ({duration}min, {distance_display})"
                                         
                                 elif section_type == "pedestrian":
                                     distance_km = distance_m / 1000
                                     distance_display = f"{distance_km:.1f}km" if distance_km >= 1.0 else f"{distance_km:.3f}km"
-                                    section_text = f"{i}. 🚶 Walking ({duration}min, {distance_display})"
+                                    section_text = f"  {i}. 🚶 Walking ({duration}min, {distance_display})"
                                     
                                 else:
-                                    section_text = f"{i}. {section_type.title()} ({duration}min)"
+                                    section_text = f"  {i}. {section_type.title()} ({duration}min)"
                                 
                                 children.append({
                                     "object": "block",
@@ -408,24 +518,31 @@ class NotionService:
                                     }
                                 })
                             
-                            # Add summary line
+                            # Add enhanced summary line
                             total_walking = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "pedestrian")
                             total_transit = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "transit")
                             
                             if total_walking > 0 and total_transit > 0:
                                 summary_text = f"📊 Summary: {total_transit}min transit + {total_walking}min walking = {prediction.duration_minutes}min total"
-                                children.append({
-                                    "object": "block",
-                                    "type": "paragraph",
-                                    "paragraph": {
-                                        "rich_text": [
-                                            {
-                                                "type": "text",
-                                                "text": {"content": summary_text}
-                                            }
-                                        ]
-                                    }
-                                })
+                            elif total_walking > 0:
+                                summary_text = f"📊 Summary: {total_walking}min walking = {prediction.duration_minutes}min total"
+                            elif total_transit > 0:
+                                summary_text = f"📊 Summary: {total_transit}min transit = {prediction.duration_minutes}min total"
+                            else:
+                                summary_text = f"📊 Total time: {prediction.duration_minutes}min"
+                                
+                            children.append({
+                                "object": "block",
+                                "type": "paragraph",
+                                "paragraph": {
+                                    "rich_text": [
+                                        {
+                                            "type": "text",
+                                            "text": {"content": summary_text}
+                                        }
+                                    ]
+                                }
+                            })
                             
                             # Add spacing
                             children.append({
@@ -441,7 +558,7 @@ class NotionService:
                                 }
                             })
                     
-            except Exception as e:
+            except Exception:
                 # If prediction calculation fails, just continue without it
                 pass
         
@@ -518,7 +635,7 @@ class NotionService:
             "children": children
         }
     
-    async def save_property_to_notion(self, property_obj: Property) -> Dict[str, Any]:
+    async def save_property_to_notion(self, property_obj: Property, prediction_info: Optional[PropertyPredictionInfo] = None) -> Dict[str, Any]:
         """
         Save a property to Notion database
         
@@ -529,7 +646,7 @@ class NotionService:
             Notion API response with created page details
         """
         try:
-            page_data = self._create_property_page_data(property_obj)
+            page_data = self._create_property_page_data(property_obj, prediction_info)
             response = self.client.pages.create(**page_data)
             
             return {
