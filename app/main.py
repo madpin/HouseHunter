@@ -1,6 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
-from app.api.routes import property_routes, notion_routes, telegram_routes
+from app.api.routes import property_routes, notion_routes, telegram_routes, interest_points_routes
 from app.config import config
 from app.services.telegram_service import TelegramService
 import asyncio
@@ -28,6 +28,7 @@ app.add_middleware(
 app.include_router(property_routes.router)
 app.include_router(notion_routes.router)
 app.include_router(telegram_routes.router)
+app.include_router(interest_points_routes.router)
 
 @app.get("/")
 async def root():

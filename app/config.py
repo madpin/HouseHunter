@@ -32,6 +32,10 @@ class Config:
     GOOGLE_MAPS_API_KEY: Optional[str] = os.getenv("GOOGLE_MAPS_API_KEY")
     OPENAI_API_KEY: Optional[str] = os.getenv("OPENAI_API_KEY")
     
+    # HERE API Configuration
+    HERE_API_KEY: Optional[str] = os.getenv("HERE_API_KEY")
+    HERE_API_ENABLED: bool = os.getenv("HERE_API_ENABLED", "false").lower() == "true"
+    
     # Logging
     LOG_LEVEL: str = os.getenv("LOG_LEVEL", "INFO")
     
@@ -49,6 +53,21 @@ class Config:
                 "Set NOTION_TOKEN and NOTION_DATABASE_ID environment variables."
             )
         return cls.NOTION_TOKEN, cls.NOTION_DATABASE_ID
+    
+    @classmethod
+    def validate_here_api_config(cls) -> bool:
+        """Validate that HERE API configuration is complete"""
+        return bool(cls.HERE_API_KEY and cls.HERE_API_ENABLED)
+    
+    @classmethod
+    def get_here_api_config(cls) -> str:
+        """Get HERE API configuration as string (api_key)"""
+        if not cls.validate_here_api_config():
+            raise ValueError(
+                "HERE API configuration incomplete. "
+                "Set HERE_API_KEY and HERE_API_ENABLED=true environment variables."
+            )
+        return cls.HERE_API_KEY
 
 # Global config instance
 config = Config() 

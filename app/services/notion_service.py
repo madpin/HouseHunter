@@ -3,6 +3,7 @@ from notion_client import Client
 from app.models.property import Property, WebsiteListing, PropertyType, ListingStatus
 from datetime import datetime
 from app.config import config
+from app.services.interest_points_service import InterestPointsService
 
 class NotionService:
     """Service for interacting with Notion API to save property data"""
@@ -25,6 +26,7 @@ class NotionService:
             raise ValueError("Notion database ID is required. Set NOTION_DATABASE_ID environment variable or pass it to constructor.")
         
         self.client = Client(auth=self.notion_token)
+        self.interest_points_service = InterestPointsService()
     
     def _format_price(self, price: float, currency: str = "EUR") -> str:
         """Format price for Notion display"""
@@ -206,6 +208,242 @@ class NotionService:
                     ]
                 }
             })
+        
+        # Add prediction times section if coordinates are available
+        if (hasattr(property_obj, 'address') and 
+            hasattr(property_obj.address, 'latitude') and 
+            hasattr(property_obj.address, 'longitude') and
+            property_obj.address.latitude is not None and 
+            property_obj.address.longitude is not None):
+            try:
+                import asyncio
+                
+                # Create a new event loop for async operations
+                try:
+                    loop = asyncio.get_event_loop()
+                except RuntimeError:
+                    loop = asyncio.new_event_loop()
+                    asyncio.set_event_loop(loop)
+                
+                # Calculate prediction times
+                property_address = f"{property_obj.address.city}, {property_obj.address.county or ''}"
+                prediction_info = loop.run_until_complete(
+                    self.interest_points_service.calculate_predictions_for_property(
+                        property_obj.address.latitude,
+                        property_obj.address.longitude,
+                        property_address
+                    )
+                )
+                
+                if prediction_info and prediction_info.predictions:
+                    # Add prediction times section
+                    children.append({
+                        "object": "block",
+                        "type": "heading_2",
+                        "heading_2": {
+                            "rich_text": [
+                                {
+                                    "type": "text",
+                                    "text": {"content": f"🚗 Next Friday 9am Predictions"}
+                                }
+                            ]
+                        }
+                    })
+                    
+                    for prediction in prediction_info.predictions:
+                        # Get interest point name
+                        point_name = prediction.destination_point_id
+                        interest_point = self.interest_points_service.get_interest_point_by_id(prediction.destination_point_id)
+                        if interest_point:
+                            point_name = interest_point.name
+                        
+                        # Get transportation mode emoji
+                        # Transportation mode emojis
+                        transport_emojis = {
+                            "DRIVING": "🚗",
+                            "WALKING": "🚶",
+                            "PUBLIC_TRANSPORT": "🚌",
+                            "BICYCLING": "🚲",
+                            "TRUCK": "🚛",
+                            "TAXI": "🚕",
+                            "BUS": "🚌",
+                            "TRAIN": "🚆",
+                            "SUBWAY": "🚇",
+                            "TRAM": "🚊",
+                            "FERRY": "⛴️"
+                        }
+                        mode_emoji = transport_emojis.get(prediction.transportation_mode.value, "🚗")
+                        
+                        # Build route details
+                        route_info = ""
+                        if prediction.route_details:
+                            route_details = prediction.route_details
+                            if route_details.get("transport_legs"):
+                                transport_legs = route_details["transport_legs"]
+                                if len(transport_legs) == 1:
+                                    route_info = f" • {transport_legs[0]['line']}"
+                                else:
+                                    transport_names = [leg.get('line', 'Unknown') for leg in transport_legs]
+                                    route_info = f" • {' + '.join(transport_names)}"
+                            
+                            # Add walking information
+                            total_walking = route_details.get("total_walking_minutes", 0)
+                            if total_walking > 0:
+                                if total_walking < 1:
+                                    route_info += " • short walk"
+                                elif total_walking < 5:
+                                    route_info += f" • {total_walking}min walk"
+                                else:
+                                    route_info += f" • {total_walking}min walking"
+                        
+                        # Use route summary if available, otherwise use route_info
+                        route_display = prediction.route_summary if prediction.route_summary else route_info
+                        
+                        # Format distance with one decimal place (unless less than 1km)
+                        distance_display = f"{prediction.distance_km:.1f}km" if prediction.distance_km >= 1.0 else f"{prediction.distance_km:.3f}km"
+                        
+                        # Add walking distance information if available
+                        walking_info = ""
+                        if hasattr(prediction, 'total_walking_distance_km') and prediction.total_walking_distance_km > 0:
+                            walking_distance = prediction.total_walking_distance_km
+                            if walking_distance >= 1.0:
+                                walking_info = f" (🚶 {walking_distance:.1f}km walking)"
+                            else:
+                                walking_info = f" (🚶 {walking_distance:.3f}km walking)"
+                        elif prediction.route_details:
+                            # Fallback to route details for walking info
+                            total_walking = 0
+                            for section in prediction.route_details:
+                                if section.get("type") == "pedestrian":
+                                    total_walking += section.get("duration_minutes", 0)
+                            if total_walking > 0:
+                                walking_info = f" (🚶 {total_walking}min walking)"
+                        
+                        prediction_text = (
+                            f"• {mode_emoji} {point_name}: "
+                            f"{prediction.duration_minutes}min ({distance_display}){walking_info}"
+                            f"{route_display} • Depart: {prediction.departure_time} • Arrive: {prediction.arrival_time}"
+                        )
+                        
+                        children.append({
+                            "object": "block",
+                            "type": "paragraph",
+                            "paragraph": {
+                                "rich_text": [
+                                    {
+                                        "type": "text",
+                                        "text": {"content": prediction_text}
+                                    }
+                                ]
+                            }
+                        })
+                        
+                        # Add detailed route information if available
+                        if prediction.route_details and len(prediction.route_details) > 0:
+                            # Add route details heading
+                            children.append({
+                                "object": "block",
+                                "type": "heading_3",
+                                "heading_3": {
+                                    "rich_text": [
+                                        {
+                                            "type": "text",
+                                            "text": {"content": f"Route Details to {point_name}"}
+                                        }
+                                    ]
+                                }
+                            })
+                            
+                            # Add route breakdown
+                            for i, section in enumerate(prediction.route_details, 1):
+                                section_type = section.get("type", "unknown")
+                                duration = section.get("duration_minutes", 0)
+                                distance_m = section.get("distance_m", 0)
+                                
+                                if section_type == "transit":
+                                    mode = section.get("mode", "unknown")
+                                    name = section.get("name", "Unknown")
+                                    line = section.get("line", "")
+                                    
+                                    # Mode-specific emojis
+                                    mode_emojis = {
+                                        "bus": "🚌",
+                                        "train": "🚆", 
+                                        "subway": "🚇",
+                                        "tram": "🚊",
+                                        "ferry": "⛴️",
+                                        "lightRail": "🚊",
+                                        "cityTrain": "🚆",
+                                        "regionalTrain": "🚆",
+                                        "intercityTrain": "🚆"
+                                    }
+                                    
+                                    mode_emoji = mode_emojis.get(mode, "🚌")
+                                    distance_km = distance_m / 1000
+                                    distance_display = f"{distance_km:.1f}km" if distance_km >= 1.0 else f"{distance_km:.3f}km"
+                                    
+                                    if line and line != "Unknown":
+                                        section_text = f"{i}. {mode_emoji} {line} ({duration}min, {distance_display})"
+                                    else:
+                                        section_text = f"{i}. {mode_emoji} {name} ({duration}min, {distance_display})"
+                                        
+                                elif section_type == "pedestrian":
+                                    distance_km = distance_m / 1000
+                                    distance_display = f"{distance_km:.1f}km" if distance_km >= 1.0 else f"{distance_km:.3f}km"
+                                    section_text = f"{i}. 🚶 Walking ({duration}min, {distance_display})"
+                                    
+                                else:
+                                    section_text = f"{i}. {section_type.title()} ({duration}min)"
+                                
+                                children.append({
+                                    "object": "block",
+                                    "type": "paragraph",
+                                    "paragraph": {
+                                        "rich_text": [
+                                            {
+                                                "type": "text",
+                                                "text": {"content": section_text}
+                                            }
+                                        ]
+                                    }
+                                })
+                            
+                            # Add summary line
+                            total_walking = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "pedestrian")
+                            total_transit = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "transit")
+                            
+                            if total_walking > 0 and total_transit > 0:
+                                summary_text = f"📊 Summary: {total_transit}min transit + {total_walking}min walking = {prediction.duration_minutes}min total"
+                                children.append({
+                                    "object": "block",
+                                    "type": "paragraph",
+                                    "paragraph": {
+                                        "rich_text": [
+                                            {
+                                                "type": "text",
+                                                "text": {"content": summary_text}
+                                            }
+                                        ]
+                                    }
+                                })
+                            
+                            # Add spacing
+                            children.append({
+                                "object": "block",
+                                "type": "paragraph",
+                                "paragraph": {
+                                    "rich_text": [
+                                        {
+                                            "type": "text",
+                                            "text": {"content": ""}
+                                        }
+                                    ]
+                                }
+                            })
+                    
+            except Exception as e:
+                # If prediction calculation fails, just continue without it
+                pass
         
         # Add listings section
         if property_obj.listings:

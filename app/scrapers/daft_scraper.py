@@ -1,6 +1,6 @@
 import re
 import asyncio
-from typing import Optional, Dict, Any, List
+from typing import Optional, Dict, Any, List, Tuple
 from pydantic import HttpUrl
 from bs4 import BeautifulSoup
 import aiohttp
@@ -160,12 +160,17 @@ class DaftScraper(BaseScraper):
                     postal_area = address_match.group(4).strip() if address_match.group(4) else None
                     postal_code = address_match.group(5) if address_match.group(5) else None
                     
+                    # Try to extract coordinates if available
+                    latitude, longitude = self._extract_coordinates(soup)
+                    
                     return Address(
                         street=street,
                         city=city,
                         county=county,
                         postal_code=postal_code,
-                        formatted_address=text
+                        formatted_address=text,
+                        latitude=latitude,
+                        longitude=longitude
                     )
         
         # Try to extract from page title as fallback
@@ -181,15 +186,120 @@ class DaftScraper(BaseScraper):
                 postal_area = address_match.group(4).strip() if address_match.group(4) else None
                 postal_code = address_match.group(5) if address_match.group(5) else None
                 
+                # Try to extract coordinates if available
+                latitude, longitude = self._extract_coordinates(soup)
+                
                 return Address(
                     street=street,
                     city=city,
                     county=county,
                     postal_code=postal_code,
-                    formatted_address=title_text
+                    formatted_address=title_text,
+                    latitude=latitude,
+                    longitude=longitude
                 )
         
         return None
+    
+    def _extract_coordinates(self, soup: BeautifulSoup) -> Tuple[Optional[float], Optional[float]]:
+        """Extract coordinates from the page if available"""
+        try:
+            # 1) Structured data: JSON-LD with GeoCoordinates
+            try:
+                import json
+            except Exception:
+                json = None
+            if json is not None:
+                for script in soup.find_all("script", attrs={"type": "application/ld+json"}):
+                    try:
+                        content = script.string or script.get_text()
+                        if not content:
+                            continue
+                        data = json.loads(content)
+                        # JSON-LD may be a list or dict
+                        candidates = data if isinstance(data, list) else [data]
+                        for item in candidates:
+                            geo = item.get("geo") if isinstance(item, dict) else None
+                            if isinstance(geo, dict):
+                                lat = geo.get("latitude")
+                                lng = geo.get("longitude")
+                                if lat is not None and lng is not None:
+                                    return float(lat), float(lng)
+                    except Exception:
+                        # Ignore JSON-LD parsing issues and continue
+                        pass
+
+            # 2) Meta tags with coordinates
+            meta_tags = soup.find_all('meta')
+            found_lat = None
+            for meta in meta_tags:
+                name = (meta.get('name') or meta.get('property') or '').lower()
+                content = meta.get('content', '')
+                if 'latitude' in name:
+                    try:
+                        found_lat = float(content)
+                    except ValueError:
+                        continue
+                if 'longitude' in name and found_lat is not None:
+                    try:
+                        found_lng = float(content)
+                        return found_lat, found_lng
+                    except ValueError:
+                        continue
+
+            # 3) Script tags: common Daft/react state patterns (lat/lng or latitude/longitude)
+            #    Try robust regex that captures a pair close together
+            scripts = soup.find_all('script')
+            import re as _re
+            pair_patterns = [
+                # Explicit lat/lng named fields in objects
+                _re.compile(r'(?:\"lat\"|\"latitude\")\s*:\s*([\-0-9\.]+)\s*,\s*(?:\"lng\"|\"longitude\")\s*:\s*([\-0-9\.]+)'),
+                _re.compile(r'(?:\"lng\"|\"longitude\")\s*:\s*([\-0-9\.]+)\s*,\s*(?:\"lat\"|\"latitude\")\s*:\s*([\-0-9\.]+)'),
+                # Center object
+                _re.compile(r'\"center\"\s*:\s*\{\s*\"lat\"\s*:\s*([\-0-9\.]+)\s*,\s*\"lng\"\s*:\s*([\-0-9\.]+)\s*\}'),
+                # Coordinates array, often [lng, lat]
+                _re.compile(r'\"coordinates\"\s*:\s*\[\s*([\-0-9\.]+)\s*,\s*([\-0-9\.]+)\s*\]')
+            ]
+            def _normalize_pair(a: str, b: str) -> Tuple[float, float]:
+                la, lb = float(a), float(b)
+                # If first value looks like longitude (abs>90) and second like latitude, swap
+                if abs(la) > 90 and abs(lb) <= 90:
+                    return lb, la
+                # If values look like [lng, lat] (common in GeoJSON) where |lng| < |lat| around Ireland, swap
+                if abs(la) < abs(lb):
+                    return lb, la
+                # Otherwise keep order assuming (lat, lng)
+                return la, lb
+            for script in scripts:
+                content = script.string or script.get_text()
+                if not content:
+                    continue
+                for pat in pair_patterns:
+                    m = pat.search(content)
+                    if m:
+                        v1, v2 = m.groups()
+                        try:
+                            lat_val, lng_val = _normalize_pair(v1, v2)
+                            # Validate ranges
+                            if -90.0 <= lat_val <= 90.0 and -180.0 <= lng_val <= 180.0:
+                                return lat_val, lng_val
+                        except ValueError:
+                            continue
+
+            # 4) Data attributes found on map containers (data-lat/data-lng)
+            elements_with_coords = soup.find_all(attrs={'data-lat': True, 'data-lng': True})
+            for element in elements_with_coords:
+                try:
+                    latitude = float(element.get('data-lat'))
+                    longitude = float(element.get('data-lng'))
+                    return latitude, longitude
+                except (ValueError, TypeError):
+                    continue
+
+        except Exception as e:
+            print(f"Error extracting coordinates: {e}")
+        
+        return None, None
     
     def _extract_property_details(self, soup: BeautifulSoup) -> Dict[str, Any]:
         """Extract property details like bedrooms, bathrooms, area, etc."""

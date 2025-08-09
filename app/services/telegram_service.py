@@ -8,6 +8,8 @@ from pydantic import HttpUrl, ValidationError
 from app.config import config
 from app.services.notion_service import NotionService
 from app.services.property_service import PropertyService
+from app.services.interest_points_service import InterestPointsService
+from app.services.geocoding_service import GeocodingService
 from app.scrapers.scraper_factory import ScraperFactory
 from app.models.property import Property
 
@@ -25,7 +27,9 @@ class TelegramService:
                  bot_token: Optional[str] = None,
                  notion_service: Optional[NotionService] = None,
                  property_service: Optional[PropertyService] = None,
-                 scraper_factory: Optional[ScraperFactory] = None):
+                 scraper_factory: Optional[ScraperFactory] = None,
+                 interest_points_service: Optional[InterestPointsService] = None,
+                 geocoding_service: Optional[GeocodingService] = None):
         """
         Initialize Telegram service
         
@@ -34,6 +38,8 @@ class TelegramService:
             notion_service: NotionService instance
             property_service: PropertyService instance  
             scraper_factory: ScraperFactory instance
+            interest_points_service: InterestPointsService instance
+            geocoding_service: GeocodingService instance
         """
         self.bot_token = bot_token or config.TELEGRAM_BOT_TOKEN
         if not self.bot_token:
@@ -42,6 +48,8 @@ class TelegramService:
         self.notion_service = notion_service or NotionService()
         self.property_service = property_service or PropertyService()
         self.scraper_factory = scraper_factory or ScraperFactory()
+        self.interest_points_service = interest_points_service or InterestPointsService()
+        self.geocoding_service = geocoding_service or GeocodingService()
         
         self.application: Optional[Application] = None
         self.is_running = False
@@ -247,11 +255,70 @@ class TelegramService:
             
             notion_result = await self.notion_service.save_property_to_notion(saved_property)
             
+            # Calculate prediction times for next Friday at 9am
+            await processing_msg.edit_text(
+                f"🚗 Calculating prediction times for next Friday 9am...\n📍 {url_str}"
+            )
+            
+            prediction_info = None
+            try:
+                # Check if property has coordinates
+                has_coordinates = False
+                latitude = None
+                longitude = None
+                
+                logger.info(f"Checking coordinates for property: {property_data.address if hasattr(property_data, 'address') else 'No address'}")
+                
+                if (hasattr(property_data, 'address') and 
+                    hasattr(property_data.address, 'latitude') and 
+                    hasattr(property_data.address, 'longitude') and
+                    property_data.address.latitude is not None and 
+                    property_data.address.longitude is not None):
+                    has_coordinates = True
+                    latitude = property_data.address.latitude
+                    longitude = property_data.address.longitude
+                    logger.info(f"Property has coordinates from scraper: {latitude}, {longitude}")
+                else:
+                    logger.info("Property coordinates not available from scraper, attempting geocoding...")
+                    
+                    # Try geocoding as fallback
+                    if hasattr(property_data, 'address') and property_data.address:
+                        geocoded_coords = await self.geocoding_service.geocode_property_address(property_data.address)
+                        if geocoded_coords:
+                            has_coordinates = True
+                            latitude, longitude = geocoded_coords
+                            logger.info(f"Property coordinates obtained via geocoding: {latitude}, {longitude}")
+                            
+                            # Update the property address with the geocoded coordinates
+                            property_data.address.latitude = latitude
+                            property_data.address.longitude = longitude
+                        else:
+                            logger.warning("Geocoding failed, no coordinates available")
+                    else:
+                        logger.warning("No address object available for geocoding")
+                
+                if has_coordinates and latitude is not None and longitude is not None:
+                    property_address = f"{property_data.address.city}, {property_data.address.county or ''}"
+                    prediction_info = await self.interest_points_service.calculate_predictions_for_property(
+                        latitude,
+                        longitude,
+                        property_address
+                    )
+                    logger.info(f"Prediction info calculated: {len(prediction_info.predictions) if prediction_info else 0} predictions")
+                else:
+                    logger.info("No coordinates available, skipping prediction times")
+                    
+            except Exception as e:
+                logger.warning(f"Failed to calculate prediction times: {e}")
+                import traceback
+                logger.warning(f"Traceback: {traceback.format_exc()}")
+            
             # Send success/failure message
             if notion_result.get("success"):
                 # Add username prefix for group chats
                 username_prefix = f"👤 @{username}: " if update.effective_chat.type in ['group', 'supergroup'] else ""
                 
+                # Build success message
                 success_message = (
                     f"{username_prefix}✅ Property saved successfully!\n\n"
                     f"🏠 {property_data.property_type.value.title()}\n"
@@ -259,9 +326,183 @@ class TelegramService:
                     f"🛏️ {property_data.bedrooms} bed, {property_data.bathrooms} bath\n"
                     f"📐 {property_data.area_sqm}m²\n"
                     f"💰 {property_data.primary_listing.price if property_data.primary_listing else 'N/A'}\n\n"
+                )
+                
+                # Add prediction times if available
+                if prediction_info and prediction_info.predictions and len(prediction_info.predictions) > 0:
+                    success_message += f"🚗 **Next Friday 9am Predictions:**\n"
+                    for prediction in prediction_info.predictions:
+                        point_name = prediction.destination_point_id
+                        # Try to get the actual point name
+                        interest_point = self.interest_points_service.get_interest_point_by_id(prediction.destination_point_id)
+                        if interest_point:
+                            point_name = interest_point.name
+                        
+                        # Transportation mode emojis
+                        transport_emojis = {
+                            "DRIVING": "🚗",
+                            "WALKING": "🚶",
+                            "PUBLIC_TRANSPORT": "🚌",
+                            "BICYCLING": "🚲",
+                            "TRUCK": "🚛",
+                            "TAXI": "🚕",
+                            "BUS": "🚌",
+                            "TRAIN": "🚆",
+                            "SUBWAY": "🚇",
+                            "TRAM": "🚊",
+                            "FERRY": "⛴️"
+                        }
+                        
+                        # Get the appropriate emoji for the transportation mode
+                        transport_emoji = transport_emojis.get(prediction.transportation_mode.value.upper(), "🚗")
+                        
+                        # For public transport, use a more specific emoji based on the route details
+                        if prediction.transportation_mode.value == "publicTransport" and prediction.route_details:
+                            # Check if we have transit sections to determine the primary mode
+                            transit_sections = [s for s in prediction.route_details if s.get("type") == "transit"]
+                            if transit_sections:
+                                primary_mode = transit_sections[0].get("mode", "bus")
+                                mode_emojis = {
+                                    "bus": "🚌",
+                                    "train": "🚆", 
+                                    "subway": "🚇",
+                                    "tram": "🚊",
+                                    "ferry": "⛴️",
+                                    "lightRail": "🚊",
+                                    "cityTrain": "🚆",
+                                    "regionalTrain": "🚆",
+                                    "intercityTrain": "🚆"
+                                }
+                                transport_emoji = mode_emojis.get(primary_mode, "🚌")
+                        
+                        # Build route details
+                        route_info = ""
+                        if prediction.route_details:
+                            route_details = prediction.route_details
+                            
+                            # Format route details for public transport
+                            if prediction.transportation_mode.value == "publicTransport":
+                                route_parts = []
+                                
+                                for section in route_details:
+                                    section_type = section.get("type", "unknown")
+                                    if section_type == "transit":
+                                        mode = section.get("mode", "unknown")
+                                        name = section.get("name", "Unknown")
+                                        line = section.get("line", "")
+                                        
+                                        # Mode-specific emojis
+                                        mode_emojis = {
+                                            "bus": "🚌",
+                                            "train": "🚆", 
+                                            "subway": "🚇",
+                                            "tram": "🚊",
+                                            "ferry": "⛴️",
+                                            "lightRail": "🚊",
+                                            "cityTrain": "🚆",
+                                            "regionalTrain": "🚆",
+                                            "intercityTrain": "🚆"
+                                        }
+                                        
+                                        mode_emoji = mode_emojis.get(mode, "🚌")
+                                        if line and line != "Unknown":
+                                            route_parts.append(f"{mode_emoji} {line}")
+                                        else:
+                                            route_parts.append(f"{mode_emoji} {name}")
+                                            
+                                    elif section_type == "pedestrian":
+                                        duration = section.get("duration_minutes", 0)
+                                        if duration > 0:
+                                            if duration < 1:
+                                                route_parts.append("🚶 short walk")
+                                            elif duration < 5:
+                                                route_parts.append(f"🚶 {duration}min walk")
+                                            else:
+                                                route_parts.append(f"🚶 {duration}min walking")
+                                
+                                if route_parts:
+                                    route_info = " • " + " + ".join(route_parts)
+                            else:
+                                # Handle other transportation modes (driving, walking, etc.)
+                                if route_details.get("transport_legs"):
+                                    transport_legs = route_details["transport_legs"]
+                                    if len(transport_legs) == 1:
+                                        route_info = f" • {transport_legs[0]['line']}"
+                                    else:
+                                        transport_names = [leg.get('line', 'Unknown') for leg in transport_legs]
+                                        route_info = f" • {' + '.join(transport_names)}"
+                                
+                                # Add walking information
+                                total_walking = route_details.get("total_walking_minutes", 0)
+                                if total_walking > 0:
+                                    if total_walking < 1:
+                                        route_info += " • short walk"
+                                    elif total_walking < 5:
+                                        route_info += f" • {total_walking}min walk"
+                                    else:
+                                        route_info += f" • {total_walking}min walking"
+                        
+                        # Use route summary if available, otherwise use route_info
+                        route_display = prediction.route_summary if prediction.route_summary else route_info
+                        
+                        # Format distance with one decimal place (unless less than 1km)
+                        distance_display = f"{prediction.distance_km:.1f}km" if prediction.distance_km >= 1.0 else f"{prediction.distance_km:.3f}km"
+                        
+                        # Add walking distance information if available
+                        walking_info = ""
+                        if hasattr(prediction, 'total_walking_distance_km') and prediction.total_walking_distance_km > 0:
+                            walking_distance = prediction.total_walking_distance_km
+                            if walking_distance >= 1.0:
+                                walking_info = f" (🚶 {walking_distance:.1f}km walking)"
+                            else:
+                                walking_info = f" (🚶 {walking_distance:.3f}km walking)"
+                        elif prediction.route_details:
+                            # Fallback to route details for walking info
+                            total_walking = 0
+                            for section in prediction.route_details:
+                                if section.get("type") == "pedestrian":
+                                    total_walking += section.get("duration_minutes", 0)
+                            if total_walking > 0:
+                                walking_info = f" (🚶 {total_walking}min walking)"
+                        
+                        success_message += (
+                            f"• {transport_emoji} **{point_name}**: "
+                            f"{prediction.duration_minutes}min ({distance_display}){walking_info}\n"
+                            f"  Depart: {prediction.departure_time} • Arrive: {prediction.arrival_time}\n"
+                        )
+                        
+                        # Add route summary information if available
+                        if prediction.route_details and len(prediction.route_details) > 0:
+                            num_legs = len(prediction.route_details)
+                            total_walking = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "pedestrian")
+                            total_transit = sum(s.get("duration_minutes", 0) for s in prediction.route_details if s.get("type") == "transit")
+                            
+                            # Count different types of legs
+                            walking_legs = sum(1 for s in prediction.route_details if s.get("type") == "pedestrian")
+                            transit_legs = sum(1 for s in prediction.route_details if s.get("type") == "transit")
+                            
+                            summary_parts = []
+                            if transit_legs > 0:
+                                summary_parts.append(f"🚌 {transit_legs} transit")
+                            if walking_legs > 0:
+                                summary_parts.append(f"🚶 {walking_legs} walking")
+                            
+                            summary_text = f"  📊 {num_legs} legs: {' + '.join(summary_parts)} • ⏱️ {total_transit}min transit + {total_walking}min walking"
+                            success_message += f"{summary_text}\n"
+                        
+                        success_message += "\n"
+                
+                elif not has_coordinates:
+                    success_message += "⚠️ *Prediction times not available* - Property coordinates not found\n\n"
+                else:
+                    # Coordinates are available but predictions failed or are empty
+                    success_message += "⚠️ *Prediction times not available* - Unable to calculate travel times (HERE API error)\n\n"
+                
+                success_message += (
                     f"📋 [View in Notion]({notion_result.get('notion_page_url', '#')})\n"
                     f"🔗 [Original listing]({url_str})"
                 )
+                
                 await processing_msg.edit_text(success_message, parse_mode='Markdown')
                 
                 logger.info(f"Successfully processed property for user {username}: {url_str}")

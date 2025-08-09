@@ -10,6 +10,7 @@ A comprehensive FastAPI-based property management system that supports multiple 
 - **Scalable Architecture**: Clean separation of concerns with services, models, and scrapers
 - **Extensible Scraper System**: Easy to add new website scrapers
 - **🤖 Telegram Bot Integration**: Send property URLs directly via Telegram for automatic scraping and Notion saving
+- **🗺️ Interest Points & Distance Calculations**: Calculate distances to important locations using HERE API with configurable transportation modes
 
 ## 🤖 Telegram Bot Integration
 
@@ -23,6 +24,25 @@ HouseHunter includes a Telegram bot that allows you to send property URLs direct
 5. Send property URLs to your bot!
 
 📖 **See `telegram_bot_setup.md` for detailed setup instructions.**
+
+## 🗺️ Interest Points & Distance Calculations
+
+HouseHunter includes a powerful interest points system that allows you to calculate distances from properties to important locations using the HERE API.
+
+### Features
+- **Configurable Interest Points**: Add your work, shopping centers, transport hubs, etc.
+- **Multiple Transportation Modes**: Driving, walking, public transport, cycling
+- **Distance Caching**: Intelligent caching for performance optimization
+- **Batch Calculations**: Calculate distances for multiple properties at once
+- **Easy Management**: Full CRUD operations via API endpoints
+
+### Quick Setup
+1. Sign up for a HERE API key at [here.com](https://here.com)
+2. Add `HERE_API_KEY=your_key` and `HERE_API_ENABLED=true` to your `.env` file
+3. Update the `interest_points_config.json` with your actual locations
+4. Use the API endpoints to manage interest points and calculate distances
+
+📖 **See `interest_points_setup.md` for detailed setup instructions.**
 
 ## Project Structure
 
@@ -150,6 +170,15 @@ The API will be available at:
 - `GET /notion/database/info` - Get information about the Notion database
 - `GET /notion/database/check` - Check if Notion database is accessible
 
+### Interest Points & Distance Calculations
+
+- `GET /interest-points/` - Get all interest points
+- `POST /interest-points/` - Create new interest point
+- `PUT /interest-points/{point_id}` - Update interest point
+- `DELETE /interest-points/{point_id}` - Delete interest point
+- `POST /interest-points/calculate-property-distances` - Calculate distances from property to all interest points
+- `POST /interest-points/batch-calculate-distances` - Calculate distances for multiple properties
+
 ## Property Data Model
 
 The system uses a comprehensive property model that includes:
@@ -263,6 +292,12 @@ Required variables for Notion integration:
 ```bash
 NOTION_TOKEN=your_notion_integration_token
 NOTION_DATABASE_ID=your_notion_database_id
+```
+
+Required variables for Interest Points:
+```bash
+HERE_API_KEY=your_here_api_key
+HERE_API_ENABLED=true
 ```
 
 See `env.example` for all available configuration options.
