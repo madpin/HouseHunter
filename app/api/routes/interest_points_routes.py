@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/interest-points", tags=["Interest Points"])
 
 # Global service instance
-interest_points_service = InterestPointsService()
+interest_points_service = InterestPointsService("config/interest_points_config.json")
 
 @router.get("/", response_model=List[InterestPoint])
 async def get_all_interest_points(active_only: bool = False):

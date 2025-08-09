@@ -48,7 +48,7 @@ class TelegramService:
         self.notion_service = notion_service or NotionService()
         self.property_service = property_service or PropertyService()
         self.scraper_factory = scraper_factory or ScraperFactory()
-        self.interest_points_service = interest_points_service or InterestPointsService()
+        self.interest_points_service = interest_points_service or InterestPointsService("config/interest_points_config.json")
         self.geocoding_service = geocoding_service or GeocodingService()
         
         self.application: Optional[Application] = None

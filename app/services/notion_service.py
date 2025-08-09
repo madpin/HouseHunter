@@ -27,7 +27,7 @@ class NotionService:
             raise ValueError("Notion database ID is required. Set NOTION_DATABASE_ID environment variable or pass it to constructor.")
         
         self.client = Client(auth=self.notion_token)
-        self.interest_points_service = InterestPointsService()
+        self.interest_points_service = InterestPointsService("config/interest_points_config.json")
         
         # Cache database properties to validate optional fields like "Route Details"
         self.database_properties = set()

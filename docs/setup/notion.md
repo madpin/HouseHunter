@@ -38,6 +38,9 @@ This guide will help you set up the Notion integration for the HouseHunter API.
 - **Status** (Select type) - Active/Inactive
 - **Date Added** (Date type) - When the property was added
 
+### Route Information Properties:
+- **Route Details** (Text type) - Summary of travel times and routes to key locations
+
 ### Optional Properties:
 - **Lot Size (sqm)** (Number type) - Lot size in square meters
 - **New Build** (Checkbox type) - Whether it's a new build
@@ -187,5 +190,33 @@ Here's an example of how your Notion database should be structured:
 | Year Built | Number | Construction year |
 | Status | Select | Active/Inactive |
 | Date Added | Date | When added |
+| Route Details | Text | Travel times and routes to key locations |
 
-The API will automatically populate these fields when saving properties to Notion. 
+The API will automatically populate these fields when saving properties to Notion.
+
+## Route Details in Page Content
+
+In addition to the database properties, each property page will include detailed route information in the page content:
+
+### Travel Predictions Section
+- **Next Friday 9am Travel Predictions** - Main heading with description
+- **Summary predictions** - Quick overview of travel times to each interest point
+- **Detailed route breakdowns** - Step-by-step route information including:
+  - Walking segments with duration and distance
+  - Public transport details (bus/train lines, names)
+  - Route summary with total transit vs walking time
+  - Departure and arrival times
+
+### Route Format Example
+```
+🚗 Route Details to Dublin Airport
+Route to Dublin Airport • Depart: 09:00 • Arrive: 09:55
+
+  1. 🚶 Walking (3min, 0.300km)
+  2. 🚌 E2 (42min, 12.5km)
+  3. 🚶 Walking (10min, 0.700km)
+
+📊 Summary: 42min transit + 13min walking = 55min total
+```
+
+This information is automatically calculated using the HERE API and your configured interest points. 

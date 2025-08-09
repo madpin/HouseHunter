@@ -353,26 +353,37 @@ class HereApiService:
     ) -> Dict:
         """Extract prediction data from regular route"""
         try:
-            summary = route.get("summary", {})
-            duration_seconds = summary.get("duration", 0)
-            
-            # Calculate arrival time
-            departure_dt = datetime.fromisoformat(departure_time.replace('Z', '+00:00'))
-            arrival_dt = departure_dt + timedelta(seconds=duration_seconds)
-            
-            return {
-                "origin_lat": origin_lat,
-                "origin_lng": origin_lng,
-                "dest_lat": dest_lat,
-                "dest_lng": dest_lng,
-                "transport_mode": transport_mode.value,
-                "distance_km": summary.get("length", 0) / 1000,
-                "duration_minutes": duration_seconds // 60,
-                "prediction_date": next_friday.isoformat(),
-                "departure_time": "09:00",
-                "arrival_time": arrival_dt.strftime("%H:%M"),
-                "calculated_at": datetime.now().isoformat()
-            }
+            # The new HERE API v8 structure has summary data in sections[0]
+            if "sections" in route and route["sections"]:
+                # Get the first section (main route)
+                section = route["sections"][0]
+                summary = section.get("summary", {})
+                travel_summary = section.get("travelSummary", {})
+                
+                # Use travelSummary if available, fallback to summary
+                duration_seconds = travel_summary.get("duration", summary.get("duration", 0))
+                distance_meters = travel_summary.get("length", summary.get("length", 0))
+                
+                # Calculate arrival time
+                departure_dt = datetime.fromisoformat(departure_time.replace('Z', '+00:00'))
+                arrival_dt = departure_dt + timedelta(seconds=duration_seconds)
+                
+                return {
+                    "origin_lat": origin_lat,
+                    "origin_lng": origin_lng,
+                    "dest_lat": dest_lat,
+                    "dest_lng": dest_lng,
+                    "transport_mode": transport_mode.value,
+                    "distance_km": distance_meters / 1000,
+                    "duration_minutes": duration_seconds // 60,
+                    "prediction_date": next_friday.isoformat(),
+                    "departure_time": "09:00",
+                    "arrival_time": arrival_dt.strftime("%H:%M"),
+                    "calculated_at": datetime.now().isoformat()
+                }
+            else:
+                logger.error("No sections found in route response")
+                return None
             
         except Exception as e:
             logger.error(f"Error extracting regular route prediction: {e}")

@@ -23,7 +23,7 @@ HouseHunter includes a Telegram bot that allows you to send property URLs direct
 4. Start the API - the bot will auto-start
 5. Send property URLs to your bot!
 
-📖 **See `telegram_bot_setup.md` for detailed setup instructions.**
+📖 **See the [setup documentation](docs/setup/) for detailed setup instructions.**
 
 ## 🗺️ Interest Points & Distance Calculations
 
@@ -42,33 +42,35 @@ HouseHunter includes a powerful interest points system that allows you to calcul
 3. Update the `interest_points_config.json` with your actual locations
 4. Use the API endpoints to manage interest points and calculate distances
 
-📖 **See `interest_points_setup.md` for detailed setup instructions.**
+📖 **See the [setup documentation](docs/setup/) for detailed setup instructions.**
 
 ## Project Structure
 
 ```
 HouseHunter/
-├── app/
+├── app/                        # Main FastAPI application
 │   ├── __init__.py
-│   ├── main.py                 # FastAPI application entry point
-│   ├── api/
-│   │   ├── __init__.py
-│   │   └── routes/
-│   │       ├── __init__.py
-│   │       └── property_routes.py  # Property API endpoints
-│   ├── models/
-│   │   ├── __init__.py
-│   │   └── property.py         # Property data models
-│   ├── services/
-│   │   ├── __init__.py
-│   │   └── property_service.py # Business logic layer
-│   └── scrapers/
-│       ├── __init__.py
-│       ├── base_scraper.py     # Base scraper interface
-│       ├── daft_scraper.py     # Daft.ie scraper implementation
-│       └── scraper_factory.py  # Scraper management
-├── requirements.txt
-└── README.md
+│   ├── main.py                 # Application entry point
+│   ├── api/                    # API routes and endpoints
+│   ├── models/                 # Data models
+│   ├── services/               # Business logic services
+│   └── scrapers/               # Web scraping implementations
+├── config/                     # Configuration files
+│   └── interest_points_config.json
+├── docs/                       # Documentation
+│   ├── api/                    # API documentation
+│   ├── development/            # Development guides
+│   └── setup/                  # Setup instructions
+├── scripts/                    # Utility scripts
+│   ├── setup_env.py            # Environment setup
+│   └── setup_notion_database.py
+├── tests/                      # Test suite
+│   ├── integration/            # Integration tests
+│   └── unit/                   # Unit tests
+├── docker/                     # Docker configuration
+├── requirements.txt             # Production dependencies
+├── requirements-dev.txt         # Development dependencies
+└── README.md                   # This file
 ```
 
 ## Installation
@@ -147,6 +149,12 @@ The API will be available at:
 - Main API: http://localhost:8000
 - Interactive docs: http://localhost:8000/docs
 - ReDoc docs: http://localhost:8000/redoc
+
+## Documentation
+
+- **[Setup Guides](docs/setup/)** - Complete setup instructions for all features
+- **[API Reference](docs/api/)** - API endpoint documentation
+- **[Development Guide](docs/development/)** - Implementation details and testing
 
 ## API Endpoints
 

@@ -20,7 +20,7 @@ def get_scraper_factory() -> ScraperFactory:
     return ScraperFactory()
  
 def get_interest_points_service() -> InterestPointsService:
-    return InterestPointsService()
+    return InterestPointsService("config/interest_points_config.json")
 
 @router.post("/properties/save")
 async def save_property_to_notion(
